@@ -1,0 +1,20 @@
+# Server & Framework
+fastapi
+uvicorn[standard]
+
+# Core Integration
+PyGithub
+groq
+
+# Database (MongoDB Async)
+motor
+dnspython
+
+# Data Processing
+pandas
+
+# Utilities
+python-dotenv
+python-multipart
+pydantic
+certifi
