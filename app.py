@@ -287,13 +287,13 @@ async def upload_students(file: UploadFile = File(...)):
     if 'nama' not in df.columns:
         raise HTTPException(status_code=400, detail="CSV harus punya kolom 'nama'")
     
-    students_data = [{"nama": row['nama']} for _, row in df.iterrows()]
+    students_data = [{"nama": row['nama'], "order": idx} for idx, row in df.iterrows()]
     await db.students.drop() 
     await db.students.insert_many(students_data)
     
     # Buat dokumen kosong di koleksi grades untuk tiap murid agar siap diisi Tugas 1-17
     await db.grades.drop()
-    grade_docs = [{"nama": row['nama'], "tasks": {}} for _, row in df.iterrows()]
+    grade_docs = [{"nama": row['nama'], "order": idx, "tasks": {}} for idx, row in df.iterrows()]
     await db.grades.insert_many(grade_docs)
     
     return {"message": f"Berhasil mengimpor {len(students_data)} murid"}
@@ -301,14 +301,14 @@ async def upload_students(file: UploadFile = File(...)):
 @app.get("/students")
 async def get_students():
     """Ambil daftar semua murid."""
-    students = await db.students.find({}, {"_id": 0}).to_list(length=1000)
+    students = await db.students.find({}, {"_id": 0}).sort("order", 1).to_list(length=1000)
     return students
 
 # TAB 3: NILAI KESELURUHAN
 @app.get("/grades")
 async def get_all_grades():
     """Mengembalikan daftar murid beserta nilai lengkap Tugas 1 - 17."""
-    grades = await db.grades.find({}, {"_id": 0}).to_list(length=1000)
+    grades = await db.grades.find({}, {"_id": 0}).sort("order", 1).to_list(length=1000)
     return grades
 
 # TAB 4: DETEKSI & GRADING AI
@@ -331,7 +331,7 @@ async def check_status_for_task(task_id: str):
         raise HTTPException(status_code=404, detail=f"Folder {task_id} tidak ditemukan")
     
     all_folders = [f for f in os.listdir(task_dir) if os.path.isdir(os.path.join(task_dir, f))]
-    students_db = await db.students.find().to_list(length=1000)
+    students_db = await db.students.find().sort("order", 1).to_list(length=1000)
     grades_db = await db.grades.find().to_list(length=1000)
     grades_map = {g['nama']: g.get('tasks', {}).get(task_id) for g in grades_db}
     
