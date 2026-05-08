@@ -3,17 +3,25 @@ import re
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+# pyrefly: ignore [missing-import]
 from github import Github
 from typing import List, Dict, Optional, Any
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from groq import Groq
+# pyrefly: ignore [missing-import]
 from motor.motor_asyncio import AsyncIOMotorClient
 import certifi
 import json
 import asyncio
 import threading
+import ast
+import hashlib
 from fastapi.responses import StreamingResponse
+
+# Plagiarism memory (task_id -> {hash: student_name})
+plagiarism_db = {}
+
 from grader_utils import trim_python_code, run_static_analysis, estimate_tokens, chunk_python_code
 
 load_dotenv()
@@ -84,10 +92,15 @@ async def get_engine_settings():
 # --- UTILS ---
 def extract_task_url_and_type(content: str) -> tuple[str | None, str | None]:
     """Ekstrak URL tugas dan tipenya (github atau colab)."""
-    # Cek Colab dulu
+    # Cek Colab
     colab_match = re.search(r'(https://colab\.research\.google\.com/drive/[\w-]+)', content)
     if colab_match:
         return colab_match.group(1), "colab"
+        
+    # Cek Drive
+    drive_match = re.search(r'(https://drive\.google\.com/file/d/[\w-]+|https://drive\.google\.com/open\?id=[\w-]+)', content)
+    if drive_match:
+        return drive_match.group(1), "colab"
         
     # Cek GitHub
     href_match = re.search(r'href=["\']?(https://github\.com/[\w.-]+/[\w.-]+[^"\'>\s]*)', content)
@@ -148,11 +161,20 @@ def fetch_colab_notebook(colab_url: str, log_cb=None) -> Dict[str, str]:
         if log_cb: log_cb(m)
         
     try:
-        match = re.search(r'drive/([\w-]+)', colab_url)
-        if not match:
-            log("  ❌ Invalid Colab URL")
+        file_id = None
+        if "colab.research.google.com" in colab_url:
+            match = re.search(r'drive/([\w-]+)', colab_url)
+            if match: file_id = match.group(1)
+        elif "drive.google.com/file/d/" in colab_url:
+            match = re.search(r'file/d/([\w-]+)', colab_url)
+            if match: file_id = match.group(1)
+        elif "id=" in colab_url:
+            match = re.search(r'id=([\w-]+)', colab_url)
+            if match: file_id = match.group(1)
+            
+        if not file_id:
+            log("  ❌ Invalid Colab/Drive URL")
             return {}
-        file_id = match.group(1)
         log(f"  📂 Fetching Colab ID: {file_id}")
         
         download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -454,11 +476,25 @@ FEEDBACK: [Ringkasan keseluruhan dalam 2-3 kalimat]
         code_quality = parse_int(r'CODE_QUALITY[^\d]*(\d+)', result)
         completeness = parse_int(r'COMPLETENESS[^\d]*(\d+)', result)
         best_practices = parse_int(r'BEST_PRACTICES[^\d]*(\d+)', result)
+        
+        # Jika nilai lebih dari 25, kemungkinan AI memberikan nilai /100, maka kita bagi 4
+        if correctness > 25: correctness = round(correctness / 4)
+        if code_quality > 25: code_quality = round(code_quality / 4)
+        if completeness > 25: completeness = round(completeness / 4)
+        if best_practices > 25: best_practices = round(best_practices / 4)
+
+        # Capping ke 25
+        correctness = min(25, correctness)
+        code_quality = min(25, code_quality)
+        completeness = min(25, completeness)
+        best_practices = min(25, best_practices)
+
         total = parse_int(r'TOTAL_SCORE[^\d]*(\d+)', result)
         
-        # Fallback: jika total tidak di-parse, hitung manual
-        if total == 0 and (correctness + code_quality + completeness + best_practices) > 0:
-            total = correctness + code_quality + completeness + best_practices
+        # Fallback: hitung manual selalu jika tidak valid, atau timpa jika total terlalu kecil
+        total_calculated = correctness + code_quality + completeness + best_practices
+        if total == 0 or total > 100 or total != total_calculated:
+            total = total_calculated
         
         criteria = {
             "correctness": {
@@ -483,7 +519,8 @@ FEEDBACK: [Ringkasan keseluruhan dalam 2-3 kalimat]
             }
         }
         
-        feedback = parse_str(r'FEEDBACK:\s*(.*)', result)
+        m_feedback = re.search(r'FEEDBACK:\s*([\s\S]*)', result, re.IGNORECASE)
+        feedback = m_feedback.group(1).strip() if m_feedback else ""
         if not feedback:
             feedback = "Gagal mem-parsing feedback AI."
         
@@ -668,7 +705,37 @@ async def grade_student_stream(task_id: str, student_name: str, force_ext: Optio
             else:
                 codes = fetch_all_py_files(task_url, task_id, force_ext=force_ext, log_cb=qlog)
                 
+            # Phase 6: Plagiarism Check untuk .py
+            is_plagiarized = False
+            plagiarized_from = ""
+            
+            if task_type != 'colab':
+                py_code_concat = "\n".join([content for fname, content in codes.items() if fname.endswith('.py')])
+                if py_code_concat.strip():
+                    try:
+                        parsed_ast = ast.parse(py_code_concat)
+                        normalized_code = ast.unparse(parsed_ast)
+                        code_hash = hashlib.sha256(normalized_code.encode('utf-8')).hexdigest()
+                        
+                        if task_id not in plagiarism_db:
+                            plagiarism_db[task_id] = {}
+                            
+                        if code_hash in plagiarism_db[task_id]:
+                            is_plagiarized = True
+                            plagiarized_from = plagiarism_db[task_id][code_hash]
+                            qlog(f"    🚩 PLAGIARISM DETECTED: Sama persis dengan {plagiarized_from}")
+                        else:
+                            plagiarism_db[task_id][code_hash] = student_name
+                    except Exception as e:
+                        qlog(f"    ⚠ Plagiarism check failed to parse AST: {e}")
+
             ai_result = evaluate_task(student_name, task_id, codes, settings_dict, log_cb=qlog)
+            
+            # Terapkan pinalti jika plagiat
+            if is_plagiarized:
+                ai_result["score"] = max(0, ai_result["score"] - 10)
+                ai_result["feedback"] = f"🚩 **PLAGIARISME TERDETEKSI**: Kode Anda terdeteksi sama persis secara struktural dengan '{plagiarized_from}'. Nilai dikurangi 10 poin otomatis.\n\n" + ai_result.get("feedback", "")
+
             
             # Jika groq index berubah, update settings_dict memory
             if "new_groq_index" in ai_result and ai_result["new_groq_index"] != settings_dict.get("active_groq_index"):
