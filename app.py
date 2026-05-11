@@ -65,7 +65,7 @@ class GradeUpdate(BaseModel):
 
 class BatchGradeRequest(BaseModel):
     task_id: str
-    student_names: List[str]  # Maksimal 5
+    student_names: List[str]  # Maksimal 20
     force_ext: Optional[str] = None
 
 class EngineSettingsUpdate(BaseModel):
@@ -154,6 +154,10 @@ def match_name(student_name: str, folder_list: List[str]) -> str | None:
     return None
 
 import requests
+import time
+
+# Cache untuk notebook yang sudah diunduh (key=file_id, value=processed_code)
+_notebook_cache: Dict[str, str] = {}
 
 def fetch_colab_notebook(colab_url: str, log_cb=None) -> Dict[str, str]:
     def log(m):
@@ -175,7 +179,16 @@ def fetch_colab_notebook(colab_url: str, log_cb=None) -> Dict[str, str]:
         if not file_id:
             log("  ❌ Invalid Colab/Drive URL")
             return {}
+        
+        # Cek cache dulu
+        if file_id in _notebook_cache:
+            log(f"  📂 Colab ID: {file_id} (dari cache, skip download)")
+            return {f"colab_{file_id}.ipynb": _notebook_cache[file_id]}
+        
         log(f"  📂 Fetching Colab ID: {file_id}")
+        
+        # Delay 1.5 detik antar request ke Google untuk menghindari rate limit
+        time.sleep(1.5)
         
         download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
         response = requests.get(download_url)
@@ -190,6 +203,7 @@ def fetch_colab_notebook(colab_url: str, log_cb=None) -> Dict[str, str]:
             processed_code = process_ipynb_content(raw_json)
             if processed_code:
                 log(f"    ✓ Successfully processed Colab Notebook")
+                _notebook_cache[file_id] = processed_code
                 return {f"colab_{file_id}.ipynb": processed_code}
             else:
                 log("    ⚠ Notebook is empty or invalid JSON")
